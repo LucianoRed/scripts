@@ -1,0 +1,129 @@
+- name: Provisionar instâncias EC2 na AWS e configurar inventário dinâmico
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    number_of_instances: 3
+    ami: "ami-xxxxxxxx"
+    instance_type: "t2.medium"
+    vpc_id: "vpc-xxxxxxxx"
+    subnet_id: "subnet-xxxxxxxx"
+    key_name: "kafka"
+    security_group: "all-traffic-sg"
+    region: "us-east-2"
+    ssh_user: "ec2-user"               # Usuário para acessar via SSH
+    ssh_private_key_file: "/caminho/para/sua-chave.pem"  # Caminho completo para a chave privada
+  tasks:
+    - name: Criar grupo de segurança que permite todo o tráfego
+      amazon.aws.ec2_group:
+        name: "{{ security_group }}"
+        description: "Grupo de seguranca que permite trafego de entrada e saida"
+        vpc_id: "{{ vpc_id }}"
+        region: "{{ region }}"
+        rules:
+          - proto: -1
+            from_port: 0
+            to_port: 0
+            cidr_ip: "0.0.0.0/0"
+        rules_egress:
+          - proto: -1
+            from_port: 0
+            to_port: 0
+            cidr_ip: "0.0.0.0/0"
+      register: sg_result
+
+    - name: Lançar instâncias EC2 com IP público e tag únicas
+      amazon.aws.ec2_instance:
+        image_id: "{{ ami }}"
+        instance_type: "{{ instance_type }}"
+        key_name: "{{ key_name }}"
+        subnet_id: "{{ subnet_id }}"
+        security_group: "{{ security_group }}"
+        network:
+          assign_public_ip: true
+        region: "{{ region }}"
+        wait: true
+        tags:
+          Name: "workshop{{ item }}"
+      loop: "{{ range(1, number_of_instances | int + 1) | list }}"
+      register: ec2_results
+
+    - name: Agrupar resultados das instâncias em uma lista única
+      set_fact:
+        ec2_instances_combined: "{{ ec2_results.results | map(attribute='instances') | sum(start=[]) }}"
+
+    - name: Aguardar que cada instância tenha IP público
+      amazon.aws.ec2_instance_info:
+        region: "{{ region }}"
+        instance_ids:
+          - "{{ item.instance_id }}"
+      register: ec2_info
+      until: ec2_info.instances[0].public_ip_address is defined and ec2_info.instances[0].public_ip_address | length > 0
+      retries: 10
+      delay: 15
+      loop: "{{ ec2_instances_combined }}"
+      loop_control:
+        loop_var: item
+
+    - name: Adicionar IPs das instâncias ao grupo "ec2_instances"
+      add_host:
+        hostname: >-
+          {{ (item.public_ip_address | default(item.network_interfaces[0].association.public_ip, true)) | default(item.private_ip_address) }}
+        ansible_host: >-
+          {{ (item.public_ip_address | default(item.network_interfaces[0].association.public_ip, true)) | default(item.private_ip_address) }}
+        ansible_user: "{{ ssh_user }}"
+        ansible_ssh_private_key_file: "{{ ssh_private_key_file }}"
+        groups: ec2_instances
+      loop: "{{ ec2_instances_combined }}"
+      when: item.state.name == "running"
+
+    - name: Aguardar disponibilidade do SSH nas instâncias
+      wait_for:
+        host: "{{ (item.public_ip_address | default(item.network_interfaces[0].association.public_ip, true)) | default(item.private_ip_address) }}"
+        port: 22
+        timeout: 300
+        state: started
+      loop: "{{ ec2_instances_combined }}"
+      when: item.state.name == "running"
+
+    - name: Gravar inventário dinâmico (opcional)
+      local_action: copy content="{{ ec2_instances_combined | to_nice_json }}" dest="ec2_inventory.json"
+      delegate_to: localhost
+
+- name: Atualizar configuração SSH e criar usuário nas instâncias EC2
+  hosts: ec2_instances
+  become: yes
+  tasks:
+    - name: Garantir que o PasswordAuthentication esteja habilitado no /etc/ssh/sshd_config
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?PasswordAuthentication'
+        line: 'PasswordAuthentication yes'
+        backup: yes
+
+    - name: Garantir que o PasswordAuthentication esteja habilitado no /etc/ssh/sshd_config.d/50-cloud-init.conf
+      lineinfile:
+        path: /etc/ssh/sshd_config.d/50-cloud-init.conf
+        regexp: '^#?PasswordAuthentication'
+        line: 'PasswordAuthentication yes'
+        backup: yes
+
+    - name: Reiniciar o serviço SSH para aplicar as alterações
+      service:
+        name: sshd
+        state: restarted
+
+    - name: Criar usuário 'openshift' com a senha especificada
+      user:
+        name: openshift
+        password: "$6$j9WYhYyRM1RQGZ9Q$PyjPXT9qR8I4Bvi52DcFDlQCZUsn/LU1IjFNF23SJTtzz/GTsbnWXQWv1Ov6z2BV1igoq2XNqV8Eoi6dukLku."
+        groups: wheel
+        append: yes
+        state: present
+
+    - name: Permitir que o usuário 'openshift' execute sudo sem senha
+      lineinfile:
+        path: /etc/sudoers
+        regexp: '^%wheel'
+        line: '%wheel ALL=(ALL) NOPASSWD: ALL'
+        validate: 'visudo -cf %s'
